@@ -21,57 +21,40 @@ This system provides SMB retailers with an AI-powered inventory and billing plat
 
 ```mermaid
 graph TB
-    subgraph "Client Layer"
-        A[React PWA<br/>Android WebView]
-        B[IndexedDB<br/>Offline Storage]
+    subgraph "Client"
+        A[React PWA<br/>Offline-First]
     end
     
-    subgraph "API Gateway"
-        C[FastAPI<br/>Multi-tenant Router]
-        D[Auth Middleware<br/>JWT + RBAC]
+    subgraph "Backend"
+        B[FastAPI<br/>REST API]
+        C[Python Workers<br/>Background Jobs]
     end
     
-    subgraph "Application Services"
-        E[Invoice Service]
-        F[Billing Service]
-        G[Inventory Service]
-        H[AI Co-Pilot Service]
-        I[Prediction Service]
+    subgraph "Data & Cache"
+        D[(MongoDB)]
+        E[(Redis)]
+        F[AWS SQS<br/>Job Queue]
     end
     
-    subgraph "Background Processing"
-        J[AWS SQS<br/>Message Queues]
-        K[Worker: OCR Jobs]
-        L[Worker: Predictions]
-        M[Worker: Notifications]
+    subgraph "AI Services"
+        G[Sarvam AI<br/>OCR, STT, LLM]
     end
     
-    subgraph "Data Layer"
-        N[(MongoDB<br/>Multi-tenant)]
-        O[(Redis Cache<br/>Stock Summaries)]
-    end
-    
-    subgraph "External Services"
-        P[Sarvam Document<br/>Intelligence API]
-        Q[Sarvam STT API]
-        R[Sarvam LLM API]
-        S[WhatsApp/SMS<br/>Gateway]
-    end
-
-    A -->|HTTPS/REST| C
-    A <-->|Sync| B
+    A -->|HTTPS| B
+    B --> D
+    B --> E
+    B -->|Enqueue Jobs| F
+    F -->|Poll Jobs| C
     C --> D
-    D --> E & F & G & H & I
-    E & F & G --> N
-    E & F & G --> O
-    H & I --> N & O
-    E --> J
-    J --> K & L & M
-    K -->|OCR Request| P
-    H -->|STT Request| Q
-    H -->|LLM Query| R
-    M -->|Send| S
-    K & L --> N
+    C -->|AI Requests| G
+    
+    style A fill:#e1f5ff
+    style B fill:#fff4e1
+    style C fill:#fff4e1
+    style D fill:#f0f0f0
+    style E fill:#f0f0f0
+    style F fill:#f0f0f0
+    style G fill:#e8f5e9
 ```
 
 ### Components
