@@ -27,7 +27,7 @@ graph TB
     end
     
     subgraph "API Gateway"
-        C[Express API<br/>Multi-tenant Router]
+        C[FastAPI<br/>Multi-tenant Router]
         D[Auth Middleware<br/>JWT + RBAC]
     end
     
@@ -40,7 +40,7 @@ graph TB
     end
     
     subgraph "Background Processing"
-        J[Redis Queue<br/>BullMQ]
+        J[AWS SQS<br/>Message Queues]
         K[Worker: OCR Jobs]
         L[Worker: Predictions]
         M[Worker: Notifications]
@@ -81,12 +81,13 @@ graph TB
 - **Tech:** React 18, React Query (server state), Zustand (client state), IndexedDB (offline storage), Workbox (service worker)
 - **Offline:** Cache API responses, queue mutations, sync on reconnect
 
-**Backend API: Node.js + Express**
+**Backend API: Python + FastAPI**
 - RESTful API with tenant isolation middleware
-- JWT authentication with refresh tokens
-- Rate limiting per tenant
-- Request validation (Joi/Zod)
-- Structured logging (Winston/Pino)
+- JWT authentication with refresh tokens (python-jose)
+- Rate limiting per tenant (slowapi)
+- Request/response validation (Pydantic models)
+- Structured logging (structlog)
+- Async/await for high concurrency (asyncio, motor for MongoDB)
 
 **MongoDB**
 - Document database for flexible schema evolution
@@ -95,16 +96,20 @@ graph TB
 - Change streams for real-time updates
 - Sharding strategy: tenant_id as shard key
 
-**Cache + Background Jobs: Redis + BullMQ**
+**Cache + Background Jobs: Redis + AWS SQS**
 - Redis: Cache stock summaries, session store, rate limit counters
-- BullMQ: Async job processing (OCR, predictions, notifications)
-- Job priorities, retries, dead letter queue
-- Concurrency control per job type
+- AWS SQS: Message queue for async job processing (OCR, predictions, notifications)
+- Standard queues for high throughput, FIFO queues for ordered processing
+- Dead Letter Queue (DLQ) for failed messages
+- Visibility timeout for job processing
+- Python workers poll SQS and process messages
 
 **Worker Services**
-- OCR Worker: Process invoice images via Sarvam Document Intelligence
-- Prediction Worker: Run forecasting/reorder/credit risk models
-- Notification Worker: Send WhatsApp/SMS/Email receipts and alerts
+- OCR Worker: Poll SQS queue, process invoice images via Sarvam Document Intelligence
+- Prediction Worker: Poll SQS queue, run forecasting/reorder/credit risk models
+- Notification Worker: Poll SQS queue, send WhatsApp/SMS/Email receipts and alerts
+- Workers use boto3 (AWS SDK) to receive/delete messages from SQS
+- Auto-scaling based on SQS queue depth (CloudWatch metrics)
 
 **Multi-Tenant Isolation Approach**
 - **Database Level:** Every document includes `tenant_id` field
@@ -122,22 +127,23 @@ graph TB
 ```mermaid
 sequenceDiagram
     participant U as User/Mobile
-    participant API as Express API
-    participant Q as BullMQ
+    participant API as FastAPI
+    participant Q as Celery
     participant W as OCR Worker
     participant S as Sarvam Doc Intel
     participant DB as MongoDB
     
     U->>API: POST /invoices/scan (image)
     API->>DB: Create Invoice doc (status: pending)
-    API->>Q: Enqueue OCR job
+    API->>Q: Send message to SQS (OCR queue)
     API-->>U: 202 Accepted {job_id, invoice_id}
     
-    Q->>W: Process OCR job
+    Q->>W: Worker polls SQS, receives message
     W->>S: POST /extract (image)
     S-->>W: Parsed data + confidence scores
     W->>DB: Update Invoice (status: parsed, raw_data, confidence)
-    W->>Q: Enqueue notification job
+    W->>Q: Delete message from SQS (success)
+    W->>Q: Send message to notification queue
     W-->>U: WebSocket: OCR complete
     
     U->>API: GET /invoices/:id
@@ -161,7 +167,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant U as User/Mobile
-    participant API as Express API
+    participant API as FastAPI
     participant DB as MongoDB
     participant Cache as Redis
     participant N as Notification Worker
@@ -183,10 +189,12 @@ sequenceDiagram
     API->>DB: Insert AuditLog
     API->>DB: Commit transaction
     API->>Cache: Invalidate stock summary cache
-    API->>N: Enqueue receipt notification
+    API->>J: Send message to SQS (notification queue)
     API-->>U: 201 Created {sale_id, receipt_url, due_amount}
     
-    N->>U: Send WhatsApp receipt
+    J->>M: Worker polls SQS, receives message
+    M->>U: Send WhatsApp receipt
+    M->>J: Delete message from SQS
 ```
 
 ### Workflow 3: Offline Billing → Sync → Conflict Resolution
@@ -218,7 +226,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant API as Express API
+    participant API as FastAPI
     participant STT as Sarvam STT
     participant LLM as Sarvam LLM
     participant DB as MongoDB
@@ -678,7 +686,10 @@ All collections include `tenant_id` as the first field for multi-tenant isolatio
   tenant_id: String,
   job_type: String, // ocr, stt, forecast, credit_scoring
   status: String, // queued, processing, completed, failed
-  priority: Number, // 1-10
+  
+  // SQS metadata
+  sqs_message_id: String, // SQS message ID
+  sqs_receipt_handle: String, // for deletion
   
   // Input
   input_data: Object, // { image_url, audio_url, product_ids, ... }
@@ -698,7 +709,7 @@ All collections include `tenant_id` as the first field for multi-tenant isolatio
 }
 // Indexes:
 // { tenant_id: 1, job_type: 1, status: 1, created_at: -1 }
-// { tenant_id: 1, status: 1, priority: -1 }
+// { tenant_id: 1, sqs_message_id: 1 }
 ```
 
 
@@ -932,7 +943,64 @@ Body:
 **Cost/Latency Estimate:**
 - Sarvam pricing: ~₹2-5 per invoice (assumed)
 - Latency: 5-15s per invoice (network + processing)
-- **Batching strategy:** Process invoices sequentially (no batching in MVP), queue with BullMQ for rate limiting
+- SQS cost: ~$0.40 per million requests (negligible)
+- **Processing strategy:** 
+  - Workers poll SQS with long polling (20s wait time)
+  - Process invoices sequentially per worker
+  - Scale workers based on queue depth (CloudWatch alarm)
+  - Target: Process 100 invoices/hour with 3 workers
+
+**SQS Integration Example:**
+```python
+import boto3
+import json
+
+sqs = boto3.client('sqs', region_name='ap-south-1')
+QUEUE_URL = os.getenv('SQS_OCR_QUEUE_URL')
+
+# Enqueue job (from API)
+async def enqueue_ocr_job(invoice_id: str, image_url: str):
+    message = {
+        'job_type': 'ocr',
+        'invoice_id': invoice_id,
+        'image_url': image_url,
+        'tenant_id': ctx['tenant_id']
+    }
+    response = sqs.send_message(
+        QueueUrl=QUEUE_URL,
+        MessageBody=json.dumps(message),
+        MessageAttributes={
+            'tenant_id': {'StringValue': ctx['tenant_id'], 'DataType': 'String'}
+        }
+    )
+    return response['MessageId']
+
+# Worker polls and processes
+def process_ocr_queue():
+    while True:
+        response = sqs.receive_message(
+            QueueUrl=QUEUE_URL,
+            MaxNumberOfMessages=1,
+            WaitTimeSeconds=20,  # Long polling
+            VisibilityTimeout=300  # 5 min processing time
+        )
+        
+        if 'Messages' in response:
+            for message in response['Messages']:
+                try:
+                    body = json.loads(message['Body'])
+                    process_invoice_ocr(body)
+                    
+                    # Delete message on success
+                    sqs.delete_message(
+                        QueueUrl=QUEUE_URL,
+                        ReceiptHandle=message['ReceiptHandle']
+                    )
+                except Exception as e:
+                    logger.error(f"OCR processing failed: {e}")
+                    # Message will become visible again after timeout
+                    # After max retries, goes to DLQ
+```
 
 ### B) Speech-to-Text (Sarvam STT)
 
@@ -1433,17 +1501,27 @@ Body:
 - No cross-tenant queries allowed (enforced by middleware)
 
 **Middleware:**
-```javascript
-async function tenantMiddleware(req, res, next) {
-  const token = req.headers.authorization;
-  const decoded = jwt.verify(token, SECRET);
-  req.tenantId = decoded.tenant_id;
-  req.userId = decoded.user_id;
-  
-  // Inject tenant filter into all DB queries
-  req.dbFilter = { tenant_id: req.tenantId };
-  next();
-}
+```python
+from fastapi import Request, HTTPException, Depends
+from jose import jwt, JWTError
+
+async def get_current_tenant(request: Request):
+    token = request.headers.get("authorization", "").replace("Bearer ", "")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        tenant_id = payload.get("tenant_id")
+        user_id = payload.get("user_id")
+        if not tenant_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return {"tenant_id": tenant_id, "user_id": user_id}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# Usage in endpoints
+@app.get("/products")
+async def get_products(ctx: dict = Depends(get_current_tenant)):
+    products = await db.products.find({"tenant_id": ctx["tenant_id"]}).to_list(100)
+    return products
 ```
 
 **Testing:**
@@ -1553,9 +1631,11 @@ async function tenantMiddleware(req, res, next) {
 - Analytics aggregations: <2s
 
 **Job Throughput:**
-- OCR: 10 concurrent jobs, 15s avg processing time → 40 jobs/min
+- OCR: 10 concurrent workers, 15s avg processing time → 40 jobs/min
 - Predictions: 100 tenants/hour (daily batch)
 - Notifications: 1000/min
+- SQS: Unlimited throughput (standard queues)
+- Auto-scaling: Scale workers when queue depth >100 messages
 
 **Database:**
 - MongoDB: Sharded by tenant_id (when >1TB data)
@@ -1570,19 +1650,36 @@ async function tenantMiddleware(req, res, next) {
 ### Logging
 
 **Structured Logging (JSON):**
-```javascript
+```python
+import structlog
+
+logger = structlog.get_logger()
+
+# Example log
+logger.info(
+    "sale_created",
+    tenant_id="tenant_123",
+    user_id="user_456",
+    request_id="req_789",
+    method="POST",
+    path="/sales",
+    status=201,
+    duration_ms=145
+)
+
+# Output:
 {
-  timestamp: "2026-02-09T10:30:00Z",
-  level: "info",
-  service: "api",
-  tenant_id: "tenant_123",
-  user_id: "user_456",
-  request_id: "req_789",
-  method: "POST",
-  path: "/sales",
-  status: 201,
-  duration_ms: 145,
-  message: "Sale created"
+  "timestamp": "2026-02-09T10:30:00Z",
+  "level": "info",
+  "service": "api",
+  "tenant_id": "tenant_123",
+  "user_id": "user_456",
+  "request_id": "req_789",
+  "method": "POST",
+  "path": "/sales",
+  "status": 201,
+  "duration_ms": 145,
+  "event": "sale_created"
 }
 ```
 
@@ -1603,8 +1700,10 @@ async function tenantMiddleware(req, res, next) {
 - Request rate, latency (per endpoint)
 - Error rate (4xx, 5xx)
 - Active users (concurrent)
-- Queue depth (BullMQ)
+- SQS queue depth (per queue)
+- SQS message age (oldest message)
 - Job processing time (OCR, predictions)
+- Worker health (active workers per queue)
 
 **Business Metrics:**
 - Sales created/hour
@@ -1645,7 +1744,9 @@ POST /sales [200ms]
 - API error rate >5% (5min window) → Alert
 - P95 latency >1s → Alert
 - OCR job failure rate >10% → Alert
-- Queue depth >1000 → Alert
+- SQS queue depth >1000 → Alert (scale workers)
+- SQS DLQ messages >10 → Alert (investigate failures)
+- SQS message age >1 hour → Alert (worker issues)
 - MongoDB replica lag >10s → Alert
 - Disk usage >80% → Alert
 - Sync failure rate >20% → Alert
@@ -1665,21 +1766,27 @@ POST /sales [200ms]
 - Fallback: Return 503 Service Unavailable, retry with backoff
 
 **2. Redis Down:**
-- Impact: Cache misses, queue stops
+- Impact: Cache misses, slower reads
 - Mitigation: Redis Sentinel (HA), fallback to DB for reads
 - Fallback: Degrade gracefully (slower, but functional)
+- Note: SQS is independent, jobs continue processing
 
-**3. Sarvam API Down:**
+**3. SQS Down (rare):**
+- Impact: Cannot enqueue new jobs, workers idle
+- Mitigation: AWS SQS has 99.9% SLA, multi-AZ by default
+- Fallback: Queue jobs in MongoDB (status: pending), retry enqueue later
+
+**4. Sarvam API Down:**
 - Impact: OCR/STT/LLM fail
 - Mitigation: Retry with backoff, queue jobs for later
 - Fallback: Manual entry for invoices, text-only for co-pilot
 
-**4. Network Partition (Client):**
+**5. Network Partition (Client):**
 - Impact: Sync fails
 - Mitigation: Offline mode, queue mutations
 - Fallback: Sync when reconnected
 
-**5. High Load (Traffic Spike):**
+**6. High Load (Traffic Spike):**
 - Impact: Slow responses, timeouts
 - Mitigation: Auto-scaling (horizontal), rate limiting
 - Fallback: Queue non-critical jobs, prioritize sales
@@ -1720,21 +1827,21 @@ POST /sales [200ms]
 ### Docker-Based Deployment
 
 **Services:**
-- `api`: Express API (Node.js)
-- `worker`: BullMQ workers (Node.js)
+- `api`: FastAPI (Python)
+- `worker`: Celery workers (Python)
 - `web`: React PWA (Nginx)
 - `mongodb`: Database (managed service, not containerized)
 - `redis`: Cache + queue (managed service, not containerized)
 
 **Dockerfile (API):**
 ```dockerfile
-FROM node:18-alpine
+FROM python:3.11-slim
 WORKDIR /app
-COPY package*.json ./
-RUN npm ci --only=production
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-EXPOSE 3000
-CMD ["node", "src/index.js"]
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
 
@@ -1745,23 +1852,57 @@ services:
   api:
     build: ./api
     ports:
-      - "3000:3000"
+      - "8000:8000"
     environment:
       - MONGODB_URI=mongodb://mongo:27017/inventory
       - REDIS_URI=redis://redis:6379
+      - AWS_REGION=ap-south-1
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - SQS_OCR_QUEUE_URL=${SQS_OCR_QUEUE_URL}
+      - SQS_PREDICTION_QUEUE_URL=${SQS_PREDICTION_QUEUE_URL}
+      - SQS_NOTIFICATION_QUEUE_URL=${SQS_NOTIFICATION_QUEUE_URL}
     depends_on:
       - mongo
       - redis
   
-  worker:
+  worker-ocr:
     build: ./api
-    command: node src/worker.js
+    command: python workers/ocr_worker.py
     environment:
       - MONGODB_URI=mongodb://mongo:27017/inventory
       - REDIS_URI=redis://redis:6379
+      - AWS_REGION=ap-south-1
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - SQS_OCR_QUEUE_URL=${SQS_OCR_QUEUE_URL}
     depends_on:
       - mongo
       - redis
+  
+  worker-prediction:
+    build: ./api
+    command: python workers/prediction_worker.py
+    environment:
+      - MONGODB_URI=mongodb://mongo:27017/inventory
+      - AWS_REGION=ap-south-1
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - SQS_PREDICTION_QUEUE_URL=${SQS_PREDICTION_QUEUE_URL}
+    depends_on:
+      - mongo
+  
+  worker-notification:
+    build: ./api
+    command: python workers/notification_worker.py
+    environment:
+      - MONGODB_URI=mongodb://mongo:27017/inventory
+      - AWS_REGION=ap-south-1
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - SQS_NOTIFICATION_QUEUE_URL=${SQS_NOTIFICATION_QUEUE_URL}
+    depends_on:
+      - mongo
   
   web:
     build: ./web
@@ -1784,12 +1925,13 @@ volumes:
 ```
 
 **Kubernetes (Prod):**
-- Deployments: api (3 replicas), worker (2 replicas), web (2 replicas)
+- Deployments: api (3 replicas), worker-ocr (2 replicas), worker-prediction (1 replica), worker-notification (2 replicas), web (2 replicas)
 - Services: LoadBalancer for API, ClusterIP for internal
-- ConfigMaps: Non-sensitive config
-- Secrets: API keys, DB credentials
-- HPA: Auto-scale API based on CPU >70%
+- ConfigMaps: Non-sensitive config, SQS queue URLs
+- Secrets: API keys, DB credentials, AWS credentials
+- HPA: Auto-scale API based on CPU >70%, workers based on SQS queue depth (CloudWatch → KEDA)
 - Ingress: HTTPS termination, routing
+- IAM Roles: Use IRSA (IAM Roles for Service Accounts) for SQS access, no hardcoded credentials
 
 ### Database Backup/Restore
 
@@ -1817,21 +1959,31 @@ volumes:
 
 ## 11. Trade-offs & Alternatives
 
-### Why MERN?
+### Why FastAPI + MongoDB + React?
 
-**Chosen:** MongoDB, Express, React, Node.js
+**Chosen:** FastAPI (Python), MongoDB, React
 
 **Rationale:**
-- **Single language (JavaScript):** Easier hiring, code sharing (validation logic)
+- **FastAPI:** Modern async Python framework, automatic API docs (OpenAPI/Swagger), Pydantic validation, high performance (comparable to Node.js)
+- **Python:** Native ML/AI ecosystem (NumPy, Pandas, scikit-learn), easier to integrate prediction models, team expertise
 - **MongoDB:** Flexible schema for evolving requirements, good for multi-tenant
 - **React:** Rich ecosystem, PWA support, fast development
-- **Node.js:** Non-blocking I/O for high concurrency, good for real-time features
+- **Async Python:** FastAPI + motor (async MongoDB driver) provides non-blocking I/O for high concurrency
+
+**Advantages over Node.js:**
+- **AI/ML Integration:** Native Python libraries for forecasting, credit scoring (no need for separate services)
+- **Data Processing:** Pandas for analytics, NumPy for calculations
+- **Type Safety:** Pydantic models provide runtime validation + IDE autocomplete
+- **Performance:** FastAPI with uvicorn is as fast as Express for I/O-bound tasks
+- **Developer Experience:** Automatic API documentation, better error messages
 
 **Alternatives Considered:**
+- **Node.js + Express:** Good for real-time, but weaker ML ecosystem
+  - Trade-off: Chose Python for native AI/ML capabilities
+- **Django:** More batteries-included, but heavier, slower than FastAPI
+  - Trade-off: Chose FastAPI for performance + modern async patterns
 - **PostgreSQL:** More mature, better for complex queries, but rigid schema
   - Trade-off: Chose MongoDB for schema flexibility (early-stage product)
-- **Django (Python):** Great for ML integration, but slower than Node for I/O
-  - Trade-off: Chose Node for real-time, can call Python ML services if needed
 - **React Native:** True native app, better performance
   - Trade-off: Chose PWA for faster iteration, single codebase, no app store delays
 
@@ -1859,20 +2011,33 @@ volumes:
 
 ### Why Async AI Jobs?
 
-**Chosen:** BullMQ for OCR, predictions, notifications
+**Chosen:** AWS SQS for OCR, predictions, notifications
 
 **Rationale:**
 - **Decoupling:** API responds fast, jobs process in background
-- **Reliability:** Retries, dead letter queue, job persistence
-- **Scalability:** Horizontal scaling of workers
-- **Rate Limiting:** Control external API usage (Sarvam)
+- **Reliability:** Built-in retries, dead letter queue, message persistence
+- **Scalability:** Unlimited throughput, auto-scaling workers based on queue depth
+- **Rate Limiting:** Control external API usage (Sarvam) via message throttling
+- **Managed Service:** No infrastructure to maintain, high availability
+- **Cost Effective:** Pay per request, first 1M requests/month free
+- **AWS Integration:** Native integration with CloudWatch, Lambda, EventBridge
+
+**SQS Features Used:**
+- **Standard Queues:** High throughput for OCR, predictions (at-least-once delivery)
+- **FIFO Queues:** Ordered processing for notifications (exactly-once delivery)
+- **Visibility Timeout:** 30s-12h, prevents duplicate processing
+- **Message Retention:** 1-14 days (default: 4 days)
+- **Long Polling:** Reduces empty responses, lowers costs
+- **DLQ:** Failed messages after max retries go to dead letter queue for analysis
 
 **Alternatives Considered:**
-- **Synchronous:** Wait for OCR/STT in API request
-  - Trade-off: Slow UX (15s wait), ties up API threads
+- **Celery + Redis:** Python-native, but requires Redis maintenance, single point of failure
+  - Trade-off: Chose SQS for managed service, better reliability
+- **RQ (Redis Queue):** Simpler than Celery, but fewer features
+  - Trade-off: SQS provides better durability and scalability
 - **Serverless (Lambda):** Event-driven, auto-scaling
   - Trade-off: Cold starts, harder to debug, vendor lock-in
-  - May revisit for scale (>10k tenants)
+  - May use Lambda as SQS consumers for scale (>10k tenants)
 
 ### Why PWA over React Native?
 
